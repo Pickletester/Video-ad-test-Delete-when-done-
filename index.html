@@ -422,68 +422,113 @@
 
 <script>
 // ════════════════════════════════════════════════════════
-//  SIMULATED AD PLAYER
-//  Replace with your real ads/ads.json path when testing locally.
+//  REAL AD PLAYER — pulls from your GitHub ads folder
 // ════════════════════════════════════════════════════════
-(function(){
-  // Placeholder slides — gradient backgrounds with LevelUp branding
-  var FAKE_ADS = [
-    { label:"Camp Registration Open",   bg:"linear-gradient(135deg,#0d1a3a 0%,#1E2B6E 60%,#3CC440 100%)", accent:"#3CC440" },
-    { label:"Happy Hour Every Friday",  bg:"linear-gradient(135deg,#1a0533 0%,#6d28d9 60%,#c084fc 100%)", accent:"#c084fc" },
-    { label:"Golf Simulator Available", bg:"linear-gradient(135deg,#0a1a0a 0%,#14532d 60%,#3CC440 100%)", accent:"#86efac" },
-    { label:"Join Our League",          bg:"linear-gradient(135deg,#1a0d00 0%,#92400e 60%,#fbbf24 100%)", accent:"#fcd34d" },
-    { label:"Private Lessons",         bg:"linear-gradient(135deg,#0c0a1a 0%,#1e1b4b 60%,#60a5fa 100%)", accent:"#93c5fd" },
-  ];
+var ADS_FOLDER = "https://cdn.jsdelivr.net/gh/Pickletester/Video-ad-test-Delete-when-done-@main/ads/";
+var DEFAULT_IMAGE_DURATION = 10;
+var LOAD_TIMEOUT_MS = 8000;
+var PRELOAD_AHEAD = 2;
+var WATCHDOG_INTERVAL = 10000;
+var WATCHDOG_MAX_STUCK = 30000;
+var ADS_JSON_CACHE_BUCKET_SECONDS = 60;
 
-  var player = document.getElementById("adPlayer");
-  var slides = [];
-  var currentSlideIdx = 0;
-  var adTimer = null;
-  var SLIDE_DURATION = 8000; // 8 seconds per placeholder
+var adPlayer = document.getElementById("adPlayer");
+var adList = [];
+var currentEl = null;
+var advanceTimer = null;
+var loadTimer = null;
+var cycleLength = 0;
+var offsets = [];
+var imageCache = {};
+var lastAdvanceTime = Date.now();
+var watchdogTimer = null;
+var lastAdsJson = null;
 
-  // Build slides
-  FAKE_ADS.forEach(function(ad, i){
-    var div = document.createElement("div");
-    div.className = "adSlide";
-    div.style.background = ad.bg;
-    div.style.flexDirection = "column";
-    div.style.gap = "16px";
+function isVideo(f){ return /\.(mp4|webm)$/i.test(f); }
+function getSlotDuration(item){ if(item.rotate) return item.duration||DEFAULT_IMAGE_DURATION; return isVideo(item.file)?(item.duration||30):(item.duration||DEFAULT_IMAGE_DURATION); }
+function getRotateFile(item){ var now=Math.floor(Date.now()/1000),totalCycles=Math.floor(now/cycleLength),pick=totalCycles%item.files.length; return item.files[pick]; }
+function resolveFile(item){ return item.rotate?getRotateFile(item):item.file; }
 
-    // LevelUp text logo stand-in
-    var logo = document.createElement("div");
-    logo.style.cssText = "font-family:'Bebas Neue',sans-serif;font-size:28px;letter-spacing:.2em;color:"+ad.accent+";opacity:.7;";
-    logo.textContent = "LEVELUP PICKLEBALL";
+function buildOffsets(){ cycleLength=0; offsets=[]; for(var i=0;i<adList.length;i++){ offsets.push(cycleLength); cycleLength+=getSlotDuration(adList[i]); } }
 
-    var label = document.createElement("div");
-    label.style.cssText = "font-family:'Bebas Neue',sans-serif;font-size:72px;letter-spacing:.06em;color:#fff;line-height:1;text-align:center;padding:0 40px;text-shadow:0 4px 20px rgba(0,0,0,.5);";
-    label.textContent = ad.label;
+function getCurrentIndex(){ var pos=Math.floor(Date.now()/1000)%cycleLength,idx=0; for(var i=offsets.length-1;i>=0;i--){ if(pos>=offsets[i]){idx=i;break;} } return idx; }
 
-    var sub = document.createElement("div");
-    sub.style.cssText = "font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:16px;letter-spacing:.2em;color:"+ad.accent+";text-transform:uppercase;opacity:.85;";
-    sub.textContent = "Canonsburg, PA  ·  leveluppickleball.com";
+function getMsRemaining(index){ var pos=Math.floor(Date.now()/1000)%cycleLength,dur=getSlotDuration(adList[index]),elapsed=pos-offsets[index]; return Math.max((dur-elapsed)*1000,500); }
 
-    div.appendChild(logo);
-    div.appendChild(label);
-    div.appendChild(sub);
-    player.appendChild(div);
-    slides.push(div);
-  });
+function clearAdTimers(){ if(advanceTimer){clearTimeout(advanceTimer);advanceTimer=null;} if(loadTimer){clearTimeout(loadTimer);loadTimer=null;} }
 
-  function showSlide(idx){
-    slides.forEach(function(s,i){
-      s.classList.toggle("visible", i===idx);
+function forceRecovery(){ clearAdTimers(); if(currentEl){var ov=currentEl.querySelector("video");if(ov){ov.pause();ov.removeAttribute("src");ov.load();}currentEl.remove();currentEl=null;} lastAdvanceTime=Date.now(); checkAndAdvance(); }
+
+function startAdWatchdog(){ if(watchdogTimer) clearInterval(watchdogTimer); watchdogTimer=setInterval(function(){ if(Date.now()-lastAdvanceTime>WATCHDOG_MAX_STUCK) forceRecovery(); },WATCHDOG_INTERVAL); }
+
+document.addEventListener("visibilitychange",function(){ if(document.visibilityState==="visible"&&adList.length) forceRecovery(); });
+
+function preloadUpcoming(idx){ for(var i=1;i<=PRELOAD_AHEAD;i++){ var ni=(idx+i)%adList.length,file=resolveFile(adList[ni]); if(!imageCache[file]&&!isVideo(file)){var img=new Image();img.src=ADS_FOLDER+encodeURIComponent(file);imageCache[file]=img;} } }
+
+function getOrLoadImage(file,onLoad,onError){ var src=ADS_FOLDER+encodeURIComponent(file); if(imageCache[file]&&imageCache[file].complete&&imageCache[file].naturalWidth>0){onLoad(imageCache[file]);return;} var img=imageCache[file]||new Image();imageCache[file]=img;img.onload=function(){onLoad(img);};img.onerror=function(){delete imageCache[file];onError();};if(!img.src)img.src=src; }
+
+function showAdSlide(index){
+  clearAdTimers();
+  lastAdvanceTime=Date.now();
+  var item=adList[index],file=resolveFile(item);
+  if(isVideo(file)){
+    if(currentEl){var ov=currentEl.querySelector("video");if(ov){ov.pause();ov.removeAttribute("src");ov.load();}currentEl.remove();currentEl=null;}
+    var div=document.createElement("div");div.className="adSlide";
+    var vid=document.createElement("video");vid.src=ADS_FOLDER+encodeURIComponent(file);vid.muted=true;vid.playsInline=true;vid.preload="auto";
+    var vlt=setTimeout(function(){checkAndAdvance();},LOAD_TIMEOUT_MS);
+    vid.addEventListener("canplay",function(){clearTimeout(vlt);div.classList.add("visible");vid.play().catch(function(){checkAndAdvance();});});
+    vid.addEventListener("ended",checkAndAdvance);
+    vid.addEventListener("error",function(){clearTimeout(vlt);checkAndAdvance();});
+    div.appendChild(vid);adPlayer.appendChild(div);currentEl=div;
+    preloadUpcoming(index);
+    advanceTimer=setTimeout(checkAndAdvance,getMsRemaining(index)+500);
+  } else {
+    loadTimer=setTimeout(function(){delete imageCache[file];checkAndAdvance();},LOAD_TIMEOUT_MS);
+    getOrLoadImage(file,function(img){
+      clearTimeout(loadTimer);loadTimer=null;
+      var div=document.createElement("div");div.className="adSlide";
+      var imgEl=document.createElement("img");imgEl.src=img.src;imgEl.style.cssText="width:100%;height:100%;object-fit:cover;display:block;";
+      div.appendChild(imgEl);adPlayer.appendChild(div);
+      requestAnimationFrame(function(){requestAnimationFrame(function(){div.classList.add("visible");});});
+      if(currentEl){var old=currentEl;setTimeout(function(){old.classList.remove("visible");setTimeout(function(){old.remove();},350);},50);}
+      currentEl=div;preloadUpcoming(index);
+      advanceTimer=setTimeout(checkAndAdvance,getMsRemaining(index));
+    },function(){clearTimeout(loadTimer);loadTimer=null;advanceTimer=setTimeout(checkAndAdvance,500);});
+  }
+}
+
+function checkAndAdvance(){ clearAdTimers(); showAdSlide(getCurrentIndex()); }
+
+function getAdsCacheKey(){ return Math.floor(Date.now()/(ADS_JSON_CACHE_BUCKET_SECONDS*1000)); }
+
+function loadAds(){
+  fetch(ADS_FOLDER+"ads.json?v="+getAdsCacheKey())
+    .then(function(r){if(!r.ok)throw new Error("not found");return r.json();})
+    .then(function(data){
+      if(!data.ads||!data.ads.length)throw new Error("empty");
+      lastAdsJson=JSON.stringify(data.ads);
+      adList=data.ads;buildOffsets();
+      document.getElementById("adNotice").style.display="none";
+      var started=false;
+      function tryStart(){if(started)return;started=true;var ms=1000-(Date.now()%1000);setTimeout(function(){checkAndAdvance();startAdWatchdog();},ms);}
+      var loaded=0;
+      adList.forEach(function(ad){
+        var file=resolveFile(ad);
+        if(isVideo(file)){loaded++;if(loaded===adList.length)tryStart();return;}
+        var img=new Image();
+        img.onload=img.onerror=function(){loaded++;if(loaded===adList.length)tryStart();};
+        img.src=ADS_FOLDER+encodeURIComponent(file);imageCache[file]=img;
+      });
+      setTimeout(tryStart,3000);
+    })
+    .catch(function(err){
+      console.error("ads.json failed:",err);
+      var nd=document.getElementById("adNotice");if(nd)nd.textContent="Could not load ads.json — retrying...";
+      setTimeout(loadAds,15000);
     });
-  }
+}
 
-  function advance(){
-    currentSlideIdx = (currentSlideIdx + 1) % slides.length;
-    showSlide(currentSlideIdx);
-    adTimer = setTimeout(advance, SLIDE_DURATION);
-  }
-
-  showSlide(0);
-  adTimer = setTimeout(advance, SLIDE_DURATION);
-})();
+loadAds();
 
 
 // ════════════════════════════════════════════════════════
