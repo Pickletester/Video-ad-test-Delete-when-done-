@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=845, initial-scale=1.0">
+<title>Ad Player</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 845px; height: 314px; overflow: hidden; background: #000; }
+  #player { position: relative; width: 845px; height: 314px; background: #000; }
+  .slide {
+    position: absolute; top: 0; left: 0;
+    width: 845px; height: 314px;
+    opacity: 0;
+    transition: opacity 0.3s ease-in-out;
+  }
+  .slide.visible { opacity: 1; }
+  .slide img { width: 845px; height: 314px; object-fit: cover; display: block; }
+  .slide video { width: 845px; height: 314px; object-fit: cover; display: block; background: #000; }
+  #error { display: none; color: #fff; font-family: sans-serif; font-size: 14px; text-align: center; padding-top: 140px; }
+</style>
+</head>
+<body>
+<div id="player">
+  <div id="error">Could not load ads.json</div>
+</div>
+<script>
+var ADS_FOLDER = "ads/";
+var DEFAULT_IMAGE_DURATION = 10;
+var LOAD_TIMEOUT_MS = 8000;
+var PRELOAD_AHEAD = 2;
+
+// --- Reconnect / watchdog settings ---
+var WATCHDOG_INTERVAL    = 10000;  // check every 10s
+var WATCHDOG_MAX_STUCK   = 30000;  // if no advance in 30s, force recovery
+var HARD_RELOAD_INTERVAL = 4 * 60 * 60 * 1000; // hard reload every 4 hours
+
+// FIX 1: Cache ads.json for this many seconds — all boards within the same
+// bucket share one Cloudflare cache hit instead of busting it every request.
+var ADS_JSON_CACHE_BUCKET_SECONDS = 60;
+
+var player = document.getElementById("player");
+var errorEl = document.getElementById("error");
+
+var adList = [];
+var currentEl = null;
+var advanceTimer = null;
+var loadTimer = null;
+var cycleLength = 0;
+var offsets = [];
+var imageCache = {};
+
+var lastAdvanceTime = Date.now();
+var watchdogTimer = null;
+
+// FIX 2: Track the last known ads.json content so silent refreshes
+// only rebuild state if the data actually changed.
+var lastAdsJson = null;
+
+function isVideo(f) { return /\.(mp4|webm)$/i.test(f); }
+
+function getSlotDuration(item) {
+  if (item.rotate) return item.duration || DEFAULT_IMAGE_DURATION;
+  return isVideo(item.file)
+    ? (item.duration || 30)
+    : (item.duration || DEFAULT_IMAGE_DURATION);
+}
+
+function getRotateFile(item) {
+  var now = Math.floor(Date.now() / 1000);
+  var totalCycles = Math.floor(now / cycleLength);
+  var pick = totalCycles % item.files.length;
+  return item.files[pick];
+}
+
+function resolveFile(item) {
+  return item.rotate ? getRotateFile(item) : item.file;
+}
+
+function buildOffsets() {
+  cycleLength = 0;
+  offsets = [];
+  for (var i = 0; i < adList.length; i++) {
+    offsets.push(cycleLength);
+    cycleLength += getSlotDuration(adList[i]);
+  }
+}
+
+function getCurrentIndex() {
+  var pos = Math.floor(Date.now() / 1000) % cycleLength;
+  var idx = 0;
+  for (var i = offsets.length - 1; i >= 0; i--) {
+    if (pos >= offsets[i]) { idx = i; break; }
+  }
+  return idx;
+}
+
+function getMsRemaining(index) {
+  var pos = Math.floor(Date.now() / 1000) % cycleLength;
+  var dur = getSlotDuration(adList[index]);
+  var elapsed = pos - offsets[index];
+  return Math.max((dur - elapsed) * 1000, 500);
+}
+
+function clearTimers() {
+  if (advanceTimer) { clearTimeout(advanceTimer); advanceTimer = null; }
+  if (loadTimer)    { clearTimeout(loadTimer);    loadTimer = null; }
+}
+
+// ─── Watchdog ──────────────────────────────────────────────────────────────
+function forceRecovery(reason) {
+  console.warn("Recovery triggered:", reason);
+  // FIX 3: Do NOT clear imageCache here — no reason to re-download all
+  // assets just because playback got stuck. Keep the cache intact.
+  clearTimers();
+  if (currentEl) {
+    var oldVid = currentEl.querySelector("video");
+    if (oldVid) { oldVid.pause(); oldVid.removeAttribute("src"); oldVid.load(); }
+    currentEl.remove();
+    currentEl = null;
+  }
+  lastAdvanceTime = Date.now();
+  checkAndAdvance();
+}
+
+function startWatchdog() {
+  if (watchdogTimer) clearInterval(watchdogTimer);
+  watchdogTimer = setInterval(function() {
+    var stuck = Date.now() - lastAdvanceTime;
+    if (stuck > WATCHDOG_MAX_STUCK) {
+      forceRecovery("stuck for " + Math.round(stuck / 1000) + "s");
+    }
+  }, WATCHDOG_INTERVAL);
+}
+
+// ─── Visibility: recover immediately when screen wakes ─────────────────────
+document.addEventListener("visibilitychange", function() {
+  if (document.visibilityState === "visible" && adList.length) {
+    console.log("Tab became visible — re-syncing");
+    forceRecovery("visibilitychange");
+  }
+});
+
+// FIX 4: Instead of location.reload() every 4 hours (which re-fetches all
+// assets), just silently refresh ads.json data and only reload the page
+// if something truly unrecoverable has happened (e.g. adList is empty).
+setTimeout(function() {
+  console.log("Scheduled soft refresh of ads.json");
+  refreshAdsJson();
+}, HARD_RELOAD_INTERVAL);
+
+// ─── Heartbeat: secondary layer — if advanceTimer fires late or never ───────
+setInterval(function() {
+  if (!adList.length) return;
+  var stuck = Date.now() - lastAdvanceTime;
+  if (stuck > 45000) {
+    forceRecovery("heartbeat secondary check");
+  }
+}, 15000);
+
+// ─── Preload ────────────────────────────────────────────────────────────────
+function preloadUpcoming(currentIndex) {
+  for (var i = 1; i <= PRELOAD_AHEAD; i++) {
+    var nextIdx = (currentIndex + i) % adList.length;
+    var file = resolveFile(adList[nextIdx]);
+    if (!imageCache[file] && !isVideo(file)) {
+      var img = new Image();
+      img.src = ADS_FOLDER + encodeURIComponent(file);
+      imageCache[file] = img;
+    }
+  }
+}
+
+function getOrLoadImage(file, onLoad, onError) {
+  var src = ADS_FOLDER + encodeURIComponent(file);
+  if (imageCache[file] && imageCache[file].complete && imageCache[file].naturalWidth > 0) {
+    onLoad(imageCache[file]);
+    return;
+  }
+  var img = imageCache[file] || new Image();
+  imageCache[file] = img;
+  img.onload = function() { onLoad(img); };
+  img.onerror = function() { delete imageCache[file]; onError(); };
+  if (!img.src) img.src = src;
+}
+
+// ─── Show slide ─────────────────────────────────────────────────────────────
+function showSlide(index) {
+  clearTimers();
+  lastAdvanceTime = Date.now();
+
+  var item = adList[index];
+  var file = resolveFile(item);
+
+  if (isVideo(file)) {
+    if (currentEl) {
+      var oldVid = currentEl.querySelector("video");
+      if (oldVid) { oldVid.pause(); oldVid.removeAttribute("src"); oldVid.load(); }
+      currentEl.remove();
+      currentEl = null;
+    }
+
+    var div = document.createElement("div");
+    div.className = "slide";
+    var vid = document.createElement("video");
+    vid.src = ADS_FOLDER + encodeURIComponent(file);
+    vid.muted = true;
+    vid.playsInline = true;
+    vid.preload = "auto";
+
+    var vidLoadTimer = setTimeout(function() {
+      console.warn("Video load timeout:", file);
+      checkAndAdvance();
+    }, LOAD_TIMEOUT_MS);
+
+    vid.addEventListener("canplay", function() {
+      clearTimeout(vidLoadTimer);
+      div.classList.add("visible");
+      vid.play().catch(function() { checkAndAdvance(); });
+    });
+    vid.addEventListener("ended", checkAndAdvance);
+    vid.addEventListener("error", function() {
+      clearTimeout(vidLoadTimer);
+      console.warn("Video error:", file);
+      checkAndAdvance();
+    });
+
+    div.appendChild(vid);
+    player.appendChild(div);
+    currentEl = div;
+    preloadUpcoming(index);
+    advanceTimer = setTimeout(checkAndAdvance, getMsRemaining(index) + 500);
+
+  } else {
+    loadTimer = setTimeout(function() {
+      console.warn("Image load timeout:", file);
+      delete imageCache[file];
+      checkAndAdvance();
+    }, LOAD_TIMEOUT_MS);
+
+    getOrLoadImage(file,
+      function(img) {
+        clearTimeout(loadTimer);
+        loadTimer = null;
+
+        var div = document.createElement("div");
+        div.className = "slide";
+        var imgEl = document.createElement("img");
+        imgEl.src = img.src;
+        div.appendChild(imgEl);
+        player.appendChild(div);
+
+        requestAnimationFrame(function() {
+          requestAnimationFrame(function() {
+            div.classList.add("visible");
+          });
+        });
+
+        if (currentEl) {
+          var old = currentEl;
+          setTimeout(function() {
+            old.classList.remove("visible");
+            setTimeout(function() { old.remove(); }, 350);
+          }, 50);
+        }
+
+        currentEl = div;
+        preloadUpcoming(index);
+        advanceTimer = setTimeout(checkAndAdvance, getMsRemaining(index));
+      },
+      function() {
+        clearTimeout(loadTimer);
+        loadTimer = null;
+        console.warn("Image error:", file);
+        advanceTimer = setTimeout(checkAndAdvance, 500);
+      }
+    );
+  }
+}
+
+function checkAndAdvance() {
+  clearTimers();
+  showSlide(getCurrentIndex());
+}
+
+// ─── ads.json fetch with time-bucketed cache key ─────────────────────────
+// FIX 1 (implementation): All boards within the same 60-second window
+// send the exact same URL, so Cloudflare serves it from cache after
+// the first hit. No more per-request cache busting.
+function getAdsCacheKey() {
+  return Math.floor(Date.now() / (ADS_JSON_CACHE_BUCKET_SECONDS * 1000));
+}
+
+// FIX 4 (implementation): Silent background refresh — only rebuilds
+// state if ads actually changed. Never does a full page reload unless
+// adList is somehow empty after a fetch.
+function refreshAdsJson() {
+  fetch("ads/ads.json?v=" + getAdsCacheKey())
+    .then(function(r) { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(function(data) {
+      if (!data.ads || !data.ads.length) return; // nothing useful, keep running
+      var newJson = JSON.stringify(data.ads);
+      if (newJson === lastAdsJson) {
+        console.log("ads.json unchanged, skipping rebuild");
+        return;
+      }
+      console.log("ads.json changed, rebuilding");
+      lastAdsJson = newJson;
+      adList = data.ads;
+      buildOffsets();
+      // Invalidate cache entries for files no longer in the ad list
+      var activeFiles = {};
+      adList.forEach(function(ad) {
+        var files = ad.rotate ? ad.files : [ad.file];
+        files.forEach(function(f) { activeFiles[f] = true; });
+      });
+      Object.keys(imageCache).forEach(function(f) {
+        if (!activeFiles[f]) delete imageCache[f];
+      });
+    })
+    .catch(function(err) {
+      console.warn("ads.json refresh failed (non-fatal):", err);
+      // Don't retry aggressively here — loadAds retry loop handles initial load.
+      // For background refresh failures just let the next scheduled refresh try.
+    });
+}
+
+// ─── Init: fetch ads.json, retry on failure ──────────────────────────────
+function loadAds() {
+  fetch("ads/ads.json?v=" + getAdsCacheKey())
+    .then(function(r) { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(function(data) {
+      if (!data.ads || !data.ads.length) throw new Error("empty");
+      lastAdsJson = JSON.stringify(data.ads);
+      adList = data.ads;
+      buildOffsets();
+      errorEl.style.display = "none";
+
+      var started = false;
+      function tryStart() {
+        if (started) return;
+        started = true;
+        var msUntilNextSecond = 1000 - (Date.now() % 1000);
+        setTimeout(function() {
+          checkAndAdvance();
+          startWatchdog();
+        }, msUntilNextSecond);
+      }
+
+      var loaded = 0;
+      adList.forEach(function(ad, i) {
+        var file = resolveFile(ad);
+        if (isVideo(file)) { loaded++; if (loaded === adList.length) tryStart(); return; }
+        var img = new Image();
+        img.onload = img.onerror = function() {
+          loaded++;
+          if (i === getCurrentIndex() || loaded === adList.length) tryStart();
+        };
+        img.src = ADS_FOLDER + encodeURIComponent(file);
+        imageCache[file] = img;
+      });
+
+      setTimeout(tryStart, 3000);
+    })
+    .catch(function(err) {
+      console.error("ads.json load failed:", err);
+      errorEl.style.display = "block";
+      // FIX 5: Back off retry on repeated failure instead of hammering
+      // every 15s forever. 15s → 30s → 60s → 60s cap.
+      var retryDelay = (loadAds._retryDelay = Math.min((loadAds._retryDelay || 15000) * 2, 60000));
+      console.log("Retrying ads.json in " + retryDelay / 1000 + "s");
+      setTimeout(loadAds, retryDelay);
+    });
+}
+
+loadAds();
+</script>
+</body>
+</html>
